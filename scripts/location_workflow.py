@@ -20,8 +20,8 @@ with DAG("weather_location_workflow",
     
     @task
     def print_message():
-        print("The end")
-
+        print("INFO: The end")
+        
     # Define the task group
     with TaskGroup("location_fetch_group") as weather_group:
         @task
@@ -51,7 +51,7 @@ with DAG("weather_location_workflow",
                 print(f"Failed to fetch weather for {zip_code}: {e}")
 
         # Use expand inside the group
-        fetch_and_save_weather.expand(zip_code=get_zip_codes())
+        fetch_and_save_weather.expand(zip_code=get_zip_codes()) 
 
     weather_group >> print_message() 
 
