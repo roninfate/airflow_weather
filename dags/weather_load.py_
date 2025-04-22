@@ -1,0 +1,309 @@
+from airflow import DAG 
+
+from airflow.operators.python import (
+    ExternalPythonOperator,
+    PythonOperator,
+    PythonVirtualenvOperator,
+    is_venv_installed,
+)
+from airflow.operators.dummy import DummyOperator
+from airflow.operators.postgres_operator import PostgresOperator
+from airflow.providers.microsoft.mssql.hooks.mssql import MsSqlHook
+from airflow.providers.microsoft.mssql.operators.mssql import MsSqlOperator
+
+from airflow.utils.dates import days_ago
+from airflow.models import Variable
+
+import requests
+import json
+import urllib.request
+import sys
+import pandas as pd
+import os
+from configparser import ConfigParser
+from pathlib import Path 
+import http.client
+from pytz import country_names
+import requests
+import json
+from datetime import datetime, timedelta
+import psycopg2
+
+global weatherjsonobject
+
+default_args = {
+    'owner': 'Ron Hall',
+    'retries': 0,
+    'retry_delay': timedelta(minutes=1),
+
+}
+
+def writeSQLInsert(weatherobject):
+    global insertsql 
+
+    with open('/opt/airflow/sql/insertweatherdata.sql', 'w') as insertfile:
+        s1 = "insert into weather_stage(weather_data) values (' "
+        s2 = "');"
+        insertsql = s1 + str(weatherobject) + s2 
+        insertfile.writelines(insertsql)
+
+    return insertsql 
+
+def getWeatherJson(ti):
+
+    conn = http.client.HTTPSConnection("weatherapi-com.p.rapidapi.com")
+    headers = {'X-RapidAPI-Key': "958fc6f0cdmsh20a1f73f46e70d6p1757c6jsn5755135ea290",'X-RapidAPI-Host': "weatherapi-com.p.rapidapi.com"}
+
+    conn.request("GET", "/forecast.json?q=75189&days=3", headers=headers)
+
+    response = conn.getresponse()
+    data = response.read()
+
+    weatherobject = json.loads(data.decode("utf-8"))
+
+    weatherobject = str(weatherobject).replace("'", '"')
+
+    with open('/opt/airflow/data/weather.json', 'w') as outfile:
+        json.dump(weatherobject, outfile)
+
+def getCurrentWeatherData():
+    with open('/opt/airflow/data/weather.json', 'r') as openfile:
+        weatherjsonobject = json.load(openfile)
+    
+    writeSQLInsert(weatherjsonobject)
+
+def cleanup():
+    filename = '/opt/airflow/data/weather.json'
+    if os.path.isfile(filename):
+        os.remove(filename)
+        print(f"Removed file: {filename}")
+    else:
+        print(f"Error: {filename} is not found")
+
+    # filenames = '/opt/airflow/sql/insertweatherdata.sql'
+    # if os.path.isfile(filename):
+    #     os.remove(filename)
+    #     print(f"Removed file: {filename}")
+    # else:
+    #     print(f"Error: {filename} is not found")
+
+with DAG(
+    dag_id='weather_load',
+    template_searchpath='/opt/airflow/sql', 
+    default_args=default_args,
+    start_date=datetime(2024, 1, 6),
+    catchup=False, 
+    schedule_interval='@hourly'
+) as dag:
+    getWeather = PythonOperator(
+        task_id='getWeather',
+        python_callable=getWeatherJson,
+        dag=dag
+    )
+
+    updateWeatherStageProcessed = PostgresOperator(
+        task_id='updateWeatherStageProcessed',
+        postgres_conn_id='local_postgresql_weather',
+        sql='update public.weather_stage set processed = 5, processed_date = now() where processed = 0',
+        autocommit=True,
+        dag=dag 
+    )
+
+    getCurrentWeather = PythonOperator(
+        task_id='getCurrentWeather',
+        python_callable=getCurrentWeatherData,
+        dag=dag 
+    )
+
+    filename = '/opt/airflow/sql/insertweatherdata.sql'
+    f = open(filename, 'r')
+    insert_sql_command = f.read()
+
+    insertWeatherData = PostgresOperator(
+        task_id='insertWeatherData',
+        postgres_conn_id='local_postgresql_weather',
+        sql=insert_sql_command,
+        autocommit = True, 
+        dag=dag 
+    )
+
+    insertLocationData = PostgresOperator(
+        task_id='insertLocationData',
+        postgres_conn_id='local_postgresql_weather',
+        sql="call public.insert_location();",
+        autocommit=True,
+        dag=dag
+    )
+
+    insertHourlyForecastStage = PostgresOperator(
+       task_id='insertHourlyForecastStage',
+       postgres_conn_id='local_postgresql_weather',
+       sql = "call public.insert_hourly_forecast_stage()",
+       autocommit=True,
+       dag=dag 
+    )
+
+    insertHourlyForecast = PostgresOperator(
+        task_id='insertHourlyForecast',
+        postgres_conn_id='local_postgresql_weather',
+       sql = "call public.insert_hourly_forecast()",
+       autocommit=True,
+       dag=dag 
+    )
+
+    insertCurrentConditionsStage = PostgresOperator(
+       task_id='insertCurrentConditionsStage',
+       postgres_conn_id='local_postgresql_weather',
+       sql = "call public.insert_current_conditions_stage()",
+       autocommit=True,
+       dag=dag 
+    )
+
+    insertCurrentConditions = PostgresOperator(
+        task_id='insertCurrentConditions',
+        postgres_conn_id='local_postgresql_weather',
+        sql='call public.insert_current_conditions();',
+        autocommit=True,
+        dag=dag 
+    )
+
+    insertForecastStage = PostgresOperator(
+        task_id = 'insertForecastStage',
+        postgres_conn_id='local_postgresql_weather',
+        sql="call public.insert_forecast_stage()",
+        autocommit=True,
+        dag=dag
+    )
+
+    insertForecast = PostgresOperator(
+        task_id = 'insertForecast',
+        postgres_conn_id='local_postgresql_weather',
+        sql="call public.insert_forecast()",
+        autocommit=True,
+        dag=dag
+    )
+
+    updateToProcessed = PostgresOperator(
+        task_id='updateToProcessed',
+        postgres_conn_id='local_postgresql_weather',
+        sql="update public.weather_stage set processed = 1, processed_date = now() where processed = 0",
+        autocommit=True,
+        dag=dag
+    )
+
+    copyFiles = PostgresOperator(
+        task_id = 'copyFiles',
+        postgres_conn_id = 'local_postgresql_weather',
+        sql = 'call public.copy_tables_to_filesystem()',
+        autocommit = True,
+        dag = dag 
+    )
+
+    insertMSSQLLocation = MsSqlOperator(
+        task_id = 'insertMSSQLLocation',
+        mssql_conn_id = 'local_sql_weather',
+        sql = "exec Weather.dbo.usp_CopyDataFromFile @inTableName = 'locations';",
+        autocommit = True,
+        dag = dag 
+    )
+
+    insertMSSQLCurrentConditions = MsSqlOperator(
+        task_id = 'insertMSSQLCurrentConditions',
+        mssql_conn_id = 'local_sql_weather',
+        sql = "exec Weather.dbo.usp_CopyDataFromFile @inTableName = 'current_conditions';",
+        autocommit = True,
+        dag = dag 
+    )
+
+    insertMSSQLForecast = MsSqlOperator(
+        task_id = 'insertMSSQLForecast',
+        mssql_conn_id = 'local_sql_weather',
+        sql = "exec Weather.dbo.usp_CopyDataFromFile @inTableName = 'forecast';",
+        autocommit = True,
+        dag = dag 
+    )
+
+    insertMSSQLHourlyForecast = MsSqlOperator(
+        task_id = 'insertMSSQLHourlyForecast',
+        mssql_conn_id = 'local_sql_weather',
+        sql = "exec Weather.dbo.usp_CopyDataFromFile @inTableName = 'hourly_forecast';",
+        autocommit = True,
+        dag = dag 
+    )
+
+    mergeForecast = MsSqlOperator(
+        task_id = 'mergeForecast',
+        mssql_conn_id = 'local_sql_weather',
+        sql = "exec Weather.dbo.usp_MergeForecast;",
+        autocommit = True,
+        dag = dag 
+    )
+
+    mergeLocations = MsSqlOperator(
+        task_id = 'mergeLocations',
+        mssql_conn_id = 'local_sql_weather',
+        sql = "exec Weather.dbo.usp_MergeLocations",
+        autocommit = True,
+        dag = dag 
+    )
+
+    mergeCurrentConditions= MsSqlOperator(
+        task_id = 'mergeCurrentConditions',
+        mssql_conn_id = 'local_sql_weather',
+        sql = "exec Weather.dbo.usp_MergeCurrentConditions",
+        autocommit = True,
+        dag = dag 
+    )
+
+    mergeHourlyForecast = MsSqlOperator(
+        task_id = 'mergeHourlyForecast',
+        mssql_conn_id = 'local_sql_weather',
+        sql = "exec Weather.dbo.usp_MergeHourlyForecast",
+        autocommit = True,
+        dag = dag 
+    )
+
+    cleanup = PythonOperator(
+        task_id='cleanup', 
+        python_callable=cleanup,
+        dag=dag 
+    )
+
+    #task_1 = DummyOperator(task_id='task_1', dag=dag)
+    #task_2 = DummyOperator(task_id='task_2', dag=dag)
+
+    getWeather >> updateWeatherStageProcessed >> getCurrentWeather >> insertWeatherData >> insertLocationData 
+
+    insertLocationData >> insertHourlyForecastStage
+    insertLocationData >> insertCurrentConditionsStage
+    insertLocationData >> insertForecastStage 
+
+    insertHourlyForecastStage >> insertHourlyForecast
+    insertCurrentConditionsStage >> insertCurrentConditions
+    insertForecastStage >> insertForecast
+
+    insertHourlyForecast >> copyFiles
+    insertCurrentConditions >> copyFiles 
+    insertForecast >> copyFiles
+
+    copyFiles >> insertMSSQLLocation
+    copyFiles >> insertMSSQLCurrentConditions
+    copyFiles >> insertMSSQLForecast
+    copyFiles >> insertMSSQLHourlyForecast
+
+    insertMSSQLLocation >> mergeLocations
+    insertMSSQLCurrentConditions >> mergeCurrentConditions
+    insertMSSQLForecast >> mergeForecast
+    insertMSSQLHourlyForecast >> mergeHourlyForecast
+
+    mergeForecast >> updateToProcessed
+    mergeLocations >> updateToProcessed
+    mergeHourlyForecast >> updateToProcessed
+    mergeCurrentConditions >> updateToProcessed
+
+    updateToProcessed >> cleanup 
+    #task_1 >> cleanup
+    #insertWeatherData >> task_2
+    #task_2 >> cleanup
+
+ 
