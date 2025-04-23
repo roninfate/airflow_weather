@@ -18,16 +18,16 @@ with DAG("weather_location_workflow",
          schedule_interval=None,
          catchup=False):
     
-    @task
-    def print_message():
-        print("INFO: The end")
-        
     # Define the task group
     with TaskGroup("location_fetch_group") as weather_group:
         @task
         def get_zip_codes():
             return ["75189", "72956", "80525", "80209", "72903", "72762", "74966", "72714"]
         
+        @task
+        def print_message():
+            print(f"INFO: The end")
+
         @task
         def fetch_and_save_weather(zip_code: str):
             url = f"https://weatherapi-com.p.rapidapi.com/forecast.json?q={zip_code}&days=3"
@@ -47,12 +47,17 @@ with DAG("weather_location_workflow",
 
                 print(f"Saved forecast for {zip_code} to {file_path}")
 
+                print_message()
+                
             except requests.exceptions.RequestException as e:
                 print(f"Failed to fetch weather for {zip_code}: {e}")
+
+            
 
         # Use expand inside the group
         fetch_and_save_weather.expand(zip_code=get_zip_codes()) 
 
-    weather_group >> print_message() 
+        
+    #weather_group >> print_message() 
 
 
